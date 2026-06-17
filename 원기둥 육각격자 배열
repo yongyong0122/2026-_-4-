@@ -1,0 +1,140 @@
+#본 코드는 blender의 script에서 작동함
+import bpy
+import math
+from mathutils import Vector
+
+R_SHELL   = 4      
+X_RATIO   = 0.1     
+N_GRID    = 3      
+TORUS_COLOR   = (0.15, 0.55, 0.95, 1.0) 
+USE_GRADIENT  = True                        
+TUBE_SEG  = 48
+RING_SEG  = 128
+
+r_t  = X_RATIO * R_SHELL           
+R_t  = (1 - X_RATIO) * R_SHELL     
+H_shell = 2 * r_t                  
+
+delta = (math.pi**2 * X_RATIO * (1 - X_RATIO)) / (2 * math.sqrt(3))
+delta_max = math.pi**2 / (8 * math.sqrt(3))
+
+print("\n" + "="*60)
+print("  원기둥껍질 속 토러스 — 육각격자 배열")
+print("="*60)
+print(f"  R_shell = {R_SHELL:.4f}")
+print(f"  r_t     = {r_t:.4f}  (minor radius, x={X_RATIO})")
+print(f"  R_t     = {R_t:.4f}  (major radius)")
+print(f"  H_shell = {H_shell:.4f}")
+print(f"  밀도 δ  = π²x(1-x)/(2√3) = {delta:.4f}")
+print(f"  최대밀도 (x=0.5) = π²/(8√3) = {delta_max:.4f}")
+print(f"  Vigan (2014)     = 0.2220")
+print(f"  밀도 비 (본구조/Vigan) = {delta/0.222:.3f}×")
+print("="*60 + "\n")
+
+bpy.ops.object.select_all(action='SELECT')
+bpy.ops.object.delete()
+for m in list(bpy.data.meshes):    bpy.data.meshes.remove(m)
+for m in list(bpy.data.materials): bpy.data.materials.remove(m)
+
+col = bpy.data.collections.new("HexShellTori")
+bpy.context.scene.collection.children.link(col)
+
+def link_col(obj):
+    for c in obj.users_collection: c.objects.unlink(obj)
+    col.objects.link(obj)
+
+mat_cache = {}
+
+def get_mat(i, j):
+    key = (i, j)
+    if key not in mat_cache:
+        if USE_GRADIENT:
+            dist_norm = min(math.sqrt(i**2 + i*j + j**2) / (N_GRID + 1), 1.0)
+            r_ = 0.05 + 0.10 * dist_norm
+            g_ = 0.45 + 0.40 * dist_norm
+            b_ = 0.95 - 0.30 * dist_norm
+            rgba = (r_, g_, b_, 1.0)
+        else:
+            rgba = TORUS_COLOR
+
+        mat = bpy.data.materials.new(f"Mat_{i}_{j}")
+        mat.use_nodes = True
+        nd = mat.node_tree.nodes; nd.clear()
+        bsdf = nd.new('ShaderNodeBsdfPrincipled')
+        bsdf.inputs['Base Color'].default_value = rgba
+        bsdf.inputs['Metallic'].default_value   = 0.30
+        bsdf.inputs['Roughness'].default_value  = 0.22
+        bsdf.inputs['Coat Weight'].default_value = 0.5 if 'Coat Weight' in bsdf.inputs else 0
+        out = nd.new('ShaderNodeOutputMaterial')
+        mat.node_tree.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+        mat_cache[key] = mat
+    return mat_cache[key]
+
+a1x = 2 * R_SHELL;          a1y = 0.0
+a2x = R_SHELL;               a2y = R_SHELL * math.sqrt(3)
+
+total = 0
+
+for i in range(-N_GRID, N_GRID + 1):
+    for j in range(-N_GRID, N_GRID + 1):
+        cx = i * a1x + j * a2x
+        cy = i * a1y + j * a2y
+
+        mat = get_mat(i, j)
+
+        bpy.ops.mesh.primitive_torus_add(
+            major_radius   = R_t,
+            minor_radius   = r_t,
+            major_segments = RING_SEG,
+            minor_segments = TUBE_SEG,
+            location       = (cx, cy, 0.0),
+        )
+        obj = bpy.context.active_object
+        obj.name = f"Torus_{i:+d}_{j:+d}"
+        obj.data.materials.append(mat)
+        link_col(obj)
+        total += 1
+
+print(f"  토러스 배치 완료: {total}개")
+
+cam_data = bpy.data.cameras.new("Cam")
+cam_obj  = bpy.data.objects.new("Cam", cam_data)
+bpy.context.collection.objects.link(cam_obj)
+bpy.context.scene.camera = cam_obj
+span = N_GRID * 2 * R_SHELL * 2.2
+cam_data.lens = 60
+cam_obj.location       = Vector((span * 0.5, -span * 1.1, span * 0.9))
+cam_obj.rotation_euler = (math.radians(48), 0, math.radians(22))
+
+def add_area(name, loc, energy, color=(1,1,1), size=5.0):
+    ld = bpy.data.lights.new(name, type='AREA')
+    ld.energy = energy; ld.color = color; ld.size = size
+    lo = bpy.data.objects.new(name, ld); lo.location = loc
+    bpy.context.collection.objects.link(lo)
+
+s = span
+add_area("Key",  ( s*.6,  -s*1.0,  s*1.5),  s**2*180,  (1.00, 0.97, 0.92), s*1.2)
+add_area("Fill", (-s*.8,   s*0.5,  s*0.6),  s**2*60,   (0.80, 0.88, 1.00), s*0.9)
+add_area("Rim",  ( s*0.3,  s*0.8, -s*0.4),  s**2*50,   (1.00, 0.99, 0.95), s*0.6)
+add_area("Top",  ( 0,      0,      s*2.0),  s**2*30,   (1.00, 1.00, 1.00), s*1.8)
+
+world = bpy.data.worlds.new("World")
+bpy.context.scene.world = world
+world.use_nodes = True
+bg = world.node_tree.nodes.get("Background")
+if bg:
+    bg.inputs['Color'].default_value    = (0.03, 0.03, 0.05, 1.0)
+    bg.inputs['Strength'].default_value = 0.15
+
+sc = bpy.context.scene
+sc.render.engine         = 'CYCLES'
+sc.cycles.samples        = 128
+sc.cycles.use_denoising  = True
+sc.render.resolution_x   = 1920
+sc.render.resolution_y   = 1080
+
+print(f"\n✅ 완료!  {total}개 토러스  |  Numpad0 → 카메라뷰  |  F12 → 렌더")
+print(f"   앵글 B(위)/C(옆면): 카메라 섹션 주석 해제 후 재실행")
+print(f"\n   ── 밀도 요약 ──")
+print(f"   δ = π²·x(1-x)/(2√3),  x = r_t/R_shell = {X_RATIO}")
+print(f"   현재 δ = {delta:.4f}   (최대 {delta_max:.4f} at x=0.5)")

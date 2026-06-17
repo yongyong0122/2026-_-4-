@@ -1,0 +1,271 @@
+#본 코드는 blender의 script에서 작동함
+import bpy
+import bmesh
+import math
+from mathutils import Vector
+
+N = 5
+R = 10
+rho = 1.0
+overlap = 1.02
+
+CURVE_STEPS = 512
+TUBE_SIDES = 64
+
+PALETTE = [
+    (0.85, 0.10, 0.10, 1.0),
+    (0.10, 0.40, 0.90, 1.0),
+    (0.10, 0.75, 0.25, 1.0),
+    (0.95, 0.72, 0.05, 1.0),
+    (0.65, 0.15, 0.88, 1.0),
+]
+
+METALLIC = 0.15
+ROUGHNESS = 0.35
+
+r_tube = rho * math.sin(math.pi / N) * overlap
+
+print(f"\n{'='*52}")
+print(f"  Torus Link  P=1, Q=1  ×  N={N}")
+print(f"  R       = {R:.3f}")
+print(f"  rho     = {rho:.3f}")
+print(f"  r_tube  = {r_tube:.4f}")
+print(f"  접촉 간격 = {2*rho*math.sin(math.pi/N):.4f}, 튜브직경 = {2*r_tube:.4f}")
+print(f"{'='*52}\n")
+
+def clear_scene():
+    bpy.ops.object.select_all(action='SELECT')
+    bpy.ops.object.delete()
+    for b in list(bpy.data.meshes):
+        bpy.data.meshes.remove(b)
+    for b in list(bpy.data.materials):
+        bpy.data.materials.remove(b)
+
+def make_material(name, rgba, metallic=0.0, roughness=0.5):
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+    bsdf.inputs['Base Color'].default_value = rgba
+    bsdf.inputs['Metallic'].default_value = metallic
+    bsdf.inputs['Roughness'].default_value = roughness
+
+    out = nodes.new('ShaderNodeOutputMaterial')
+    links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+    return mat
+
+def ring_path(k, N, R, rho, steps):
+    pts = []
+    phase = 2 * math.pi * k / N
+
+    for i in range(steps):
+        t = 2 * math.pi * i / steps
+        phi = t + phase
+        th = t
+
+        x = (R + rho * math.cos(th)) * math.cos(phi)
+        y = (R + rho * math.cos(th)) * math.sin(phi)
+        z = rho * math.sin(th)
+
+        pts.append(Vector((x, y, z)))
+
+    return pts
+
+def compute_rmf(pts):
+    n = len(pts)
+
+    tangs = []
+    for i in range(n):
+        dt = pts[(i + 1) % n] - pts[(i - 1) % n]
+        tangs.append(dt.normalized())
+
+    norms = [None] * n
+    binorms = [None] * n
+
+    t0 = tangs[0]
+    arb = Vector((0, 0, 1)) if abs(t0.z) < 0.9 else Vector((1, 0, 0))
+
+    n0 = t0.cross(arb).normalized()
+
+    norms[0] = n0
+    binorms[0] = tangs[0].cross(n0).normalized()
+
+    for i in range(1, n):
+        v1 = pts[i] - pts[i - 1]
+        c1 = v1.dot(v1)
+
+        if c1 < 1e-12:
+            norms[i] = norms[i - 1]
+            binorms[i] = binorms[i - 1]
+            continue
+
+        rL = norms[i - 1] - (2 / c1) * v1.dot(norms[i - 1]) * v1
+        tL = tangs[i - 1] - (2 / c1) * v1.dot(tangs[i - 1]) * v1
+
+        v2 = tangs[i] - tL
+        c2 = v2.dot(v2)
+
+        nL = rL if c2 < 1e-12 else rL - (2 / c2) * v2.dot(rL) * v2
+
+        norms[i] = nL.normalized()
+        binorms[i] = tangs[i].cross(norms[i]).normalized()
+
+    dot = max(-1.0, min(1.0, norms[0].dot(norms[-1])))
+    twist = math.acos(dot)
+
+    if norms[-1].cross(norms[0]).dot(tangs[0]) < 0:
+        twist = -twist
+
+    for i in range(n):
+        angle = twist * i / n
+        axis = tangs[i]
+
+        c = math.cos(angle)
+        s = math.sin(angle)
+
+        ni = norms[i]
+
+        norms[i] = (
+            ni * c
+            + axis.cross(ni) * s
+            + axis * axis.dot(ni) * (1 - c)
+        ).normalized()
+
+        binorms[i] = tangs[i].cross(norms[i]).normalized()
+
+    return tangs, norms, binorms
+
+def build_tube(name, pts, norms, binorms, r, sides):
+    bm = bmesh.new()
+
+    n = len(pts)
+    vr = []
+
+    for i in range(n):
+        row = []
+
+        for j in range(sides):
+            a = 2 * math.pi * j / sides
+            off = r * (
+                math.cos(a) * norms[i]
+                + math.sin(a) * binorms[i]
+            )
+
+            row.append(bm.verts.new(pts[i] + off))
+
+        vr.append(row)
+
+    bm.verts.ensure_lookup_table()
+
+    for i in range(n):
+        ni = (i + 1) % n
+
+        for j in range(sides):
+            nj = (j + 1) % sides
+
+            bm.faces.new([
+                vr[i][j],
+                vr[i][nj],
+                vr[ni][nj],
+                vr[ni][j]
+            ])
+
+    mesh = bpy.data.meshes.new(name)
+
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+
+    for p in mesh.polygons:
+        p.use_smooth = True
+
+    return mesh
+
+clear_scene()
+
+for k in range(N):
+    print(f"  고리 {k+1}/{N} ...", end=" ", flush=True)
+
+    pts = ring_path(k, N, R, rho, CURVE_STEPS)
+    tangs, norms, bnorms = compute_rmf(pts)
+
+    mesh = build_tube(
+        f"Ring_{k+1:02d}",
+        pts,
+        norms,
+        bnorms,
+        r_tube,
+        TUBE_SIDES
+    )
+
+    obj = bpy.data.objects.new(f"Ring_{k+1:02d}", mesh)
+    bpy.context.collection.objects.link(obj)
+
+    mat = make_material(
+        f"Mat_{k+1:02d}",
+        PALETTE[k % len(PALETTE)],
+        METALLIC,
+        ROUGHNESS
+    )
+
+    obj.data.materials.append(mat)
+
+    print("완료")
+
+cam_data = bpy.data.cameras.new("Cam")
+cam_data.lens = 85
+
+cam_obj = bpy.data.objects.new("Cam", cam_data)
+bpy.context.collection.objects.link(cam_obj)
+
+bpy.context.scene.camera = cam_obj
+
+dist = (R + rho) * 2.5
+
+cam_obj.location = Vector((0, -dist, dist * 0.2))
+cam_obj.rotation_euler = (math.radians(82), 0, 0)
+
+def add_area(name, loc, energy, color=(1, 1, 1), size=5.0):
+    ld = bpy.data.lights.new(name, type='AREA')
+    ld.energy = energy
+    ld.color = color
+    ld.size = size
+
+    lo = bpy.data.objects.new(name, ld)
+    lo.location = loc
+
+    bpy.context.collection.objects.link(lo)
+
+s = R * 3.5
+
+add_area("Key",  (s*0.5, -s,      s*1.8), s**2*200, (1.00, 0.97, 0.93), s*1.5)
+add_area("Fill", (-s*0.7, s*0.4,  s*0.7), s**2*70,  (0.80, 0.88, 1.00), s)
+add_area("Rim",  (s*0.2,  s*0.7, -s*0.5), s**2*55,  (1.00, 0.99, 0.96), s*0.7)
+add_area("Top",  (0,      0,      s*2.2), s**2*35,  (1.00, 1.00, 1.00), s*2)
+
+world = bpy.context.scene.world or bpy.data.worlds.new("World")
+bpy.context.scene.world = world
+
+world.use_nodes = True
+
+bg = world.node_tree.nodes.get("Background")
+
+if bg:
+    bg.inputs['Color'].default_value = (0.88, 0.86, 0.82, 1.0)
+    bg.inputs['Strength'].default_value = 0.4
+
+sc = bpy.context.scene
+
+sc.render.engine = 'CYCLES'
+sc.cycles.samples = 256
+sc.cycles.use_denoising = True
+
+sc.render.resolution_x = 1920
+sc.render.resolution_y = 1920
+
+bpy.ops.object.select_all(action='DESELECT')
+
+print("\n✓ 완료!  숫자패드0 → 카메라뷰  |  Z+Rendered  |  F12 렌더")

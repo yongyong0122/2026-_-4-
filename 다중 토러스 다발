@@ -1,0 +1,208 @@
+#본 코드는 blender의 script에서 작동함
+import bpy
+import bmesh
+import math
+from mathutils import Vector
+
+R         = 10.0  
+r_unit    = 0.25  
+K_ORBITS  = 5    
+overlap   = 0.95  
+CURVE_STEPS = 512
+TUBE_SIDES  = 48
+
+PALETTE = [
+    (0.95, 0.20, 0.15, 1.0),
+    (0.15, 0.45, 0.95, 1.0),
+    (0.10, 0.78, 0.30, 1.0),
+    (0.95, 0.72, 0.05, 1.0),
+    (0.65, 0.15, 0.88, 1.0),
+    (0.05, 0.85, 0.85, 1.0),
+]
+METALLIC  = 0.15
+ROUGHNESS = 0.35
+bpy.ops.object.select_all(action='SELECT')
+bpy.ops.object.delete()
+for b in list(bpy.data.meshes):    bpy.data.meshes.remove(b)
+for b in list(bpy.data.materials): bpy.data.materials.remove(b)
+
+def make_material(name, rgba, metallic=0.0, roughness=0.5):
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+    bsdf.inputs['Base Color'].default_value = rgba
+    bsdf.inputs['Metallic'].default_value   = metallic
+    bsdf.inputs['Roughness'].default_value  = roughness
+    out = nodes.new('ShaderNodeOutputMaterial')
+    links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+    return mat
+
+def ring_path(phase_offset, R, rho, steps):
+    pts = []
+    for i in range(steps):
+        t   = 2 * math.pi * i / steps
+        phi = t + phase_offset
+        th  = t
+        x = (R + rho * math.cos(th)) * math.cos(phi)
+        y = (R + rho * math.cos(th)) * math.sin(phi)
+        z =  rho * math.sin(th)
+        pts.append(Vector((x, y, z)))
+    return pts
+
+def compute_rmf(pts):
+    n = len(pts)
+    tangs = []
+    for i in range(n):
+        dt = pts[(i+1) % n] - pts[(i-1) % n]
+        tangs.append(dt.normalized())
+
+    norms   = [None] * n
+    binorms = [None] * n
+
+    t0  = tangs[0]
+    arb = Vector((0, 0, 1)) if abs(t0.z) < 0.9 else Vector((1, 0, 0))
+    n0  = t0.cross(arb).normalized()
+    norms[0]   = n0
+    binorms[0] = tangs[0].cross(n0).normalized()
+
+    for i in range(1, n):
+        v1 = pts[i] - pts[i-1]
+        c1 = v1.dot(v1)
+        if c1 < 1e-12:
+            norms[i]   = norms[i-1]
+            binorms[i] = binorms[i-1]
+            continue
+        rL = norms[i-1] - (2/c1) * v1.dot(norms[i-1]) * v1
+        tL = tangs[i-1] - (2/c1) * v1.dot(tangs[i-1]) * v1
+        v2 = tangs[i] - tL
+        c2 = v2.dot(v2)
+        nL = rL if c2 < 1e-12 else rL - (2/c2) * v2.dot(rL) * v2
+        norms[i]   = nL.normalized()
+        binorms[i] = tangs[i].cross(norms[i]).normalized()
+
+    dot   = max(-1.0, min(1.0, norms[0].dot(norms[-1])))
+    twist = math.acos(dot)
+    if norms[-1].cross(norms[0]).dot(tangs[0]) < 0:
+        twist = -twist
+    for i in range(n):
+        angle = twist * i / n
+        axis  = tangs[i]
+        c, s  = math.cos(angle), math.sin(angle)
+        ni    = norms[i]
+        norms[i]   = (ni * c + axis.cross(ni) * s + axis * axis.dot(ni) * (1-c)).normalized()
+        binorms[i] = tangs[i].cross(norms[i]).normalized()
+    return tangs, norms, binorms
+
+def build_tube(name, pts, norms, binorms, r, sides):
+    bm = bmesh.new()
+    n  = len(pts)
+    vr = []
+    for i in range(n):
+        row = []
+        for j in range(sides):
+            a   = 2 * math.pi * j / sides
+            off = r * (math.cos(a) * norms[i] + math.sin(a) * binorms[i])
+            row.append(bm.verts.new(pts[i] + off))
+        vr.append(row)
+    bm.verts.ensure_lookup_table()
+    for i in range(n):
+        ni = (i+1) % n
+        for j in range(sides):
+            nj = (j+1) % sides
+            bm.faces.new([vr[i][j], vr[i][nj], vr[ni][nj], vr[ni][j]])
+    mesh = bpy.data.meshes.new(name)
+    bm.to_mesh(mesh); bm.free(); mesh.update()
+    for p in mesh.polygons: p.use_smooth = True
+    return mesh
+
+
+print("\n" + "="*60)
+print("  동심원 패킹 Torus Link  —  궤도 k: N_k = ⌊2πk⌋개")
+print("="*60)
+
+total_rings = 0
+
+print(f"\n  궤도 0 (중앙): 1개  rho={r_unit:.3f}")
+mat0 = make_material("Mat_k0", PALETTE[0], METALLIC, ROUGHNESS)
+pts0 = ring_path(0.0, R, 0.0, CURVE_STEPS)
+T, N_f, B = compute_rmf(pts0)
+mesh0 = build_tube("Ring_k0_j0", pts0, N_f, B, r_unit, TUBE_SIDES)
+obj0  = bpy.data.objects.new("Ring_k0_j0", mesh0)
+bpy.context.collection.objects.link(obj0)
+obj0.data.materials.append(mat0)
+total_rings += 1
+
+for k in range(1, K_ORBITS + 1):
+    rho_k = 2 * k * r_unit            
+    N_k   = int(2 * math.pi * k)    
+    r_k   = rho_k * math.sin(math.pi / N_k) * overlap 
+    mat_k = make_material(f"Mat_k{k}", PALETTE[k % len(PALETTE)], METALLIC, ROUGHNESS)
+
+    print(f"\n  궤도 {k}: N_k={N_k}개  rho={rho_k:.3f}  r_tube={r_k:.4f}")
+    for j in range(N_k):
+        phase = 2 * math.pi * j / N_k  
+        pts              = ring_path(phase, R, rho_k, CURVE_STEPS)
+        tangs, norms, bnorms = compute_rmf(pts)
+        mesh             = build_tube(
+                               f"Ring_k{k}_j{j:03d}",
+                               pts, norms, bnorms, r_k, TUBE_SIDES
+                           )
+        obj = bpy.data.objects.new(f"Ring_k{k}_j{j:03d}", mesh)
+        bpy.context.collection.objects.link(obj)
+        obj.data.materials.append(mat_k)
+
+        if j % 5 == 0:
+            print(f"    j={j:3d}/{N_k} ...", flush=True)
+
+    total_rings += N_k
+    print(f"  궤도 {k} 완료 ({N_k}개)")
+
+print(f"\n{'─'*60}")
+print(f"  총 고리 수: {total_rings}개")
+print(f"{'─'*60}\n")
+
+
+cam_data      = bpy.data.cameras.new("Cam")
+cam_data.lens = 85
+cam_obj       = bpy.data.objects.new("Cam", cam_data)
+bpy.context.collection.objects.link(cam_obj)
+bpy.context.scene.camera = cam_obj
+
+dist = (R + 2 * K_ORBITS * r_unit) * 2.8
+cam_obj.location       = Vector((0, -dist, dist * 0.25))
+cam_obj.rotation_euler = (math.radians(82), 0, 0)
+
+
+def add_area(name, loc, energy, color=(1,1,1), size=5.0):
+    ld = bpy.data.lights.new(name, type='AREA')
+    ld.energy = energy; ld.color = color; ld.size = size
+    lo = bpy.data.objects.new(name, ld); lo.location = loc
+    bpy.context.collection.objects.link(lo)
+
+s = R * 3.5
+add_area("Key",  ( s*0.5, -s,      s*1.8),  s**2*200, (1.00, 0.97, 0.93), s*1.5)
+add_area("Fill", (-s*0.7,  s*0.4,  s*0.7),  s**2*70,  (0.80, 0.88, 1.00), s)
+add_area("Rim",  ( s*0.2,  s*0.7, -s*0.5),  s**2*55,  (1.00, 0.99, 0.96), s*0.7)
+add_area("Top",  ( 0,      0,       s*2.2),  s**2*35,  (1.00, 1.00, 1.00), s*2)
+
+
+world = bpy.context.scene.world or bpy.data.worlds.new("World")
+bpy.context.scene.world = world
+world.use_nodes = True
+bg = world.node_tree.nodes.get("Background")
+if bg:
+    bg.inputs['Color'].default_value    = (0.88, 0.86, 0.82, 1.0)
+    bg.inputs['Strength'].default_value = 0.4
+
+sc = bpy.context.scene
+sc.render.engine        = 'CYCLES'
+sc.cycles.samples       = 256
+sc.cycles.use_denoising = True
+sc.render.resolution_x  = 1920
+sc.render.resolution_y  = 1920
+
+bpy.ops.object.select_all(action='DESELECT')
+print(f"✓ 완료!  총 {total_rings}개 고리  |  Numpad0 → 카메라뷰  |  F12 렌더")
